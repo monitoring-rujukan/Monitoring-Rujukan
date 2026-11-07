@@ -2417,7 +2417,7 @@ renderAll();
 </script>
 <script type="module">
 import { initializeApp, getApps } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-app.js";
-import { getAuth, onAuthStateChanged, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-auth.js";
+import { getAuth, onAuthStateChanged, signInAnonymously, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-auth.js";
 import { getDatabase, ref, onValue, update, get } from "https://www.gstatic.com/firebasejs/10.11.0/firebase-database.js";
 
 (() => {
@@ -2437,6 +2437,7 @@ import { getDatabase, ref, onValue, update, get } from "https://www.gstatic.com/
   let auth, db, dataRef, activeUser = null, stopListener = null;
   let ready = false, firstSnapshot = true, lastCloudState = emptyState();
   let syncQueue = Promise.resolve(), anonymousSignInInProgress = false;
+  let databaseConnected = false, listenerReady = false, authFailure = null, listenerFailure = null, syncFailure = null;
 
   const clone = x => JSON.parse(JSON.stringify(x ?? null));
   const stable = x => {
@@ -2463,11 +2464,22 @@ import { getDatabase, ref, onValue, update, get } from "https://www.gstatic.com/
     return normalized({batches,items,tatAliases});
   }
   function currentState(){ return normalized(window.__rujukanTrackerGetState ? window.__rujukanTrackerGetState() : emptyState()); }
-  function setStatus(text, mode='wait') {
+  function setStatus(text, mode='wait', detail='') {
     const el=$('firebaseStatus'); if(!el)return;
     el.className='firebase-status '+mode;
+    el.title=detail || text;
     const txt=$('firebaseStatusText'); if(txt)txt.textContent=text;
   }
+  function refreshConnectionStatus(){
+    if(authFailure){setStatus('Autentikasi gagal · '+authFailure.code,'error',authFailure.message);return;}
+    if(!activeUser){setStatus('Menghubungkan autentikasi…','wait');return;}
+    if(!databaseConnected){setStatus('Firebase terputus · menunggu koneksi','error','Koneksi Realtime Database belum tersambung.');return;}
+    if(listenerFailure){setStatus('Baca database gagal · '+listenerFailure.code,'error',listenerFailure.message);return;}
+    if(!listenerReady){setStatus('Terhubung · memuat data bersama…','wait');return;}
+    if(syncFailure){setStatus('Simpan cloud gagal · '+syncFailure.code,'error',syncFailure.message);return;}
+    setStatus('Realtime aktif · tersambung','online','Firebase Auth aktif, Realtime Database tersambung, dan listener data aktif.');
+  }
+  function errorInfo(err){return {code:String(err?.code||err?.name||'unknown').replace(/^auth\//,''),message:String(err?.message||err||'Tidak ada detail error')}}
 
   function mergeRow(a,b,kind) {
     if(!a)return b;if(!b)return a;
@@ -2573,7 +2585,7 @@ import { getDatabase, ref, onValue, update, get } from "https://www.gstatic.com/
     return patch;
   }
   async function syncLoop() {
-    if(!ready || !activeUser || !dataRef) return;
+    if(!ready || !activeUser || !dataRef || !databaseConnected || !listenerReady) return;
     for(let pass=0;pass<3;pass++){
       const local=currentState();
       const patch=buildPatch(lastCloudState,local);
@@ -2590,17 +2602,19 @@ import { getDatabase, ref, onValue, update, get } from "https://www.gstatic.com/
   }
   function requestSync() {
     if(!ready || !activeUser)return;
-    syncQueue=syncQueue.then(syncLoop).then(()=>setStatus('Live Sync aktif','online')).catch(err=>{
+    syncQueue=syncQueue.then(syncLoop).then(()=>{syncFailure=null;refreshConnectionStatus()}).catch(err=>{
+      syncFailure=errorInfo(err);
       console.error('Rujukan Tracker Firebase sync:',err);
-      setStatus('Sync gagal · cek Rules Firebase','error');
+      refreshConnectionStatus();
     });
   }
   function startListener(user) {
     if(stopListener){stopListener();stopListener=null;}
-    activeUser=user; ready=false; firstSnapshot=true;
+    activeUser=user; ready=false; firstSnapshot=true; listenerReady=false; listenerFailure=null;
     dataRef=ref(db,DATA_PATH);
-    setStatus('Memuat data bersama…','wait');
+    refreshConnectionStatus();
     stopListener=onValue(dataRef, snapshot=>{
+      listenerReady=true;listenerFailure=null;
       const remote=cloudToState(snapshot.val());
       if(firstSnapshot){
         firstSnapshot=false;
@@ -2608,19 +2622,20 @@ import { getDatabase, ref, onValue, update, get } from "https://www.gstatic.com/
         const merged=mergeInitial(remote,local);
         lastCloudState=remote;ready=true;
         if(sig(merged)!==sig(local) && window.__rujukanTrackerApplyFirebaseState)window.__rujukanTrackerApplyFirebaseState(merged);
+        refreshConnectionStatus();
         requestSync();
-        setStatus('Live Sync aktif','online');
         return;
       }
       const local=currentState();
       const merged=mergeChanged(lastCloudState,remote,local);
       lastCloudState=remote;
       if(sig(merged)!==sig(local) && window.__rujukanTrackerApplyFirebaseState)window.__rujukanTrackerApplyFirebaseState(merged);
+      refreshConnectionStatus();
       requestSync();
-      setStatus('Live Sync aktif','online');
     },err=>{
+      listenerFailure=errorInfo(err);listenerReady=false;
       console.error('Rujukan Tracker Firebase listener:',err);
-      setStatus('Tidak bisa membaca data · cek Rules','error');
+      refreshConnectionStatus();
     });
   }
 
@@ -2630,27 +2645,47 @@ import { getDatabase, ref, onValue, update, get } from "https://www.gstatic.com/
     const existing=getApps().find(a=>a.name==='rujukan-tracker');
     const app=existing||initializeApp(config,'rujukan-tracker');
     auth=getAuth(app);db=getDatabase(app);
-    onAuthStateChanged(auth,user=>{
-      if(user){
-        anonymousSignInInProgress=false;
-        startListener(user);
-      } else {
-        activeUser=null;ready=false;
-        if(stopListener){stopListener();stopListener=null;}
-        setStatus('Menghubungkan realtime…','wait');
-        if(!anonymousSignInInProgress){
-          anonymousSignInInProgress=true;
-          signInAnonymously(auth).catch(err=>{
-            anonymousSignInInProgress=false;
-            console.error('Firebase anonymous authentication:',err);
-            setStatus('Realtime gagal · aktifkan Anonymous Authentication','error');
-          });
+    onValue(ref(db,'.info/connected'),snapshot=>{
+      databaseConnected=snapshot.val()===true;
+      if(!databaseConnected){listenerReady=false;}
+      else if(syncFailure)syncFailure=null;
+      refreshConnectionStatus();
+      if(databaseConnected&&ready&&listenerReady)requestSync();
+    },err=>{
+      console.error('Firebase connection monitor:',err);
+      databaseConnected=false;refreshConnectionStatus();
+    });
+    setPersistence(auth,browserLocalPersistence).catch(err=>{
+      console.warn('Firebase auth persistence:',err);
+    }).finally(()=>{
+      onAuthStateChanged(auth,user=>{
+        if(user){
+          anonymousSignInInProgress=false;authFailure=null;
+          startListener(user);
+        }else{
+          activeUser=null;ready=false;listenerReady=false;
+          if(stopListener){stopListener();stopListener=null;}
+          setStatus('Menghubungkan autentikasi…','wait');
+          if(!anonymousSignInInProgress){
+            anonymousSignInInProgress=true;
+            signInAnonymously(auth).catch(err=>{
+              anonymousSignInInProgress=false;authFailure=errorInfo(err);
+              console.error('Firebase anonymous authentication:',err);
+              const label=authFailure.code==='operation-not-allowed'?'Anonymous Auth belum aktif':
+                authFailure.code==='unauthorized-domain'?'Domain belum diizinkan':
+                authFailure.code==='api-key-not-valid.-please-pass-a-valid-api-key.'?'API Key Firebase tidak valid':
+                authFailure.code==='network-request-failed'?'Jaringan autentikasi gagal':
+                'Autentikasi gagal · '+authFailure.code;
+              setStatus(label,'error',authFailure.message);
+            });
+          }
         }
-      }
+      });
     });
   } catch(err) {
+    authFailure=errorInfo(err);
     console.error('Firebase initialization:',err);
-    setStatus('Firebase gagal dimulai','error');
+    setStatus('Firebase gagal dimulai · '+authFailure.code,'error',authFailure.message);
   }
 })();
 </script>
