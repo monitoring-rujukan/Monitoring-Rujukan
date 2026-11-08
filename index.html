@@ -2038,7 +2038,7 @@ try {
 
 const { initializeApp, getApps } = await import("https://www.gstatic.com/firebasejs/10.11.0/firebase-app.js");
 const { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut } = await import("https://www.gstatic.com/firebasejs/10.11.0/firebase-auth.js");
-const { getDatabase, ref, onValue, onChildAdded, onChildChanged, onChildRemoved, update, get } = await import("https://www.gstatic.com/firebasejs/10.11.0/firebase-database.js");
+const { getDatabase, ref, onValue, onChildAdded, onChildChanged, onChildRemoved, query, orderByChild, startAt, update, get } = await import("https://www.gstatic.com/firebasejs/10.11.0/firebase-database.js");
 
 (() => {
   const $ = id => document.getElementById(id);
@@ -2231,7 +2231,7 @@ const { getDatabase, ref, onValue, onChildAdded, onChildChanged, onChildRemoved,
       setStatus('Realtime terhubung','online');
     },UI_DEBOUNCE_MS);
   }
-  function listenDelta(kind, generation) {
+  function listenDelta(kind, generation, listenSince) {
     const node=ref(db,DATA_PATH+'/'+kind);
     const changed = snapshot => {
       if(generation!==listenerGeneration)return;
@@ -2248,7 +2248,12 @@ const { getDatabase, ref, onValue, onChildAdded, onChildChanged, onChildRemoved,
       if(remoteCache[kind].delete(key))onRemoteChange();
     };
     const fail = err => {console.error('Realtime listen '+kind,err);setStatus('Sync gagal · cek izin database','error');};
-    listeners.push(onChildAdded(node,changed,fail));
+    // Existing rows were already loaded by the initial get(). Only replay
+    // additions or edits newer than that snapshot to avoid downloading every
+    // existing row a second time on each login.
+    const recentFields=kind==='batches'?['createdAt','scheduleUpdatedAt','updatedAt']:['updatedAt'];
+    const recentQueries=recentFields.map(field=>query(node,orderByChild(field),startAt(listenSince)));
+    recentQueries.forEach(recent=>listeners.push(onChildAdded(recent,changed,fail)));
     listeners.push(onChildChanged(node,changed,fail));
     listeners.push(onChildRemoved(node,removed,fail));
   }
@@ -2296,6 +2301,7 @@ const { getDatabase, ref, onValue, onChildAdded, onChildChanged, onChildRemoved,
     const generation=listenerGeneration;
     activeUser=user;
     dataRef=ref(db,DATA_PATH);
+    const listenSince=new Date(Date.now()-120000).toISOString();
     setStatus('Mengambil data bersama…','wait');
     try{
       const first=await get(dataRef);
@@ -2307,8 +2313,8 @@ const { getDatabase, ref, onValue, onChildAdded, onChildChanged, onChildRemoved,
       ready=true;
       const merged=mergeInitial(remote,local);
       if(sig(merged)!==sig(local))window.__rujukanTrackerApplyFirebaseState?.(merged);
-      // The child_added initial events are deduplicated against this snapshot.
-      ['batches','items','tatAliases'].forEach(kind=>listenDelta(kind,generation));
+      // These listeners now return only recent records missing from the snapshot.
+      ['batches','items','tatAliases'].forEach(kind=>listenDelta(kind,generation,listenSince));
       requestSync();
       if(connected)setStatus('Realtime terhubung','online');
     }catch(err){
